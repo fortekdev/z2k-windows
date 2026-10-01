@@ -1,0 +1,30 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // F5: preLaunchTask поднимает (или переиспользует) next dev :3123 и esbuild --watch,
+      // затем запускается Electron с отладкой main-процесса (брейкпоинты в electron/src/*.ts через sourcemap).
+      "name": "z2k: Electron (dev)",
+      "type": "node",
+      "request": "launch",
+      "cwd": "${workspaceFolder}",
+      "runtimeExecutable": "${workspaceFolder}/node_modules/.bin/electron",
+      "windows": { "runtimeExecutable": "${workspaceFolder}/node_modules/electron/dist/electron.exe" },
+      "args": ["."],
+      "env": {
+        "Z2K_DEV": "1",
+        // VS Code (сам Electron) может передать ELECTRON_RUN_AS_NODE=1 — тогда require('electron') ломается
+        "ELECTRON_RUN_AS_NODE": null,
+        // Предупреждение о CSP в dev ожидаемо (Next dev использует eval)
+        "ELECTRON_DISABLE_SECURITY_WARNINGS": "true"
+      },
+      "console": "internalConsole",
+      "outputCapture": "std",
+      "autoAttachChildProcesses": false,
+      "preLaunchTask": "dev: build all",
+      "sourceMaps": true,
+      "outFiles": ["${workspaceFolder}/dist-electron/**/*.js"],
+      "skipFiles": ["<node_internals>/**"]
+    }
+  ]
+}

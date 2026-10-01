@@ -1,0 +1,728 @@
+// Package account — регистрация устройства в Cloudflare WARP и device.json.
+//
+// Протокол — Cloudflare'а: POST /reg заводит устройство по публичному ключу
+// X25519, PATCH включает warp_enabled (без него туннель не несёт TCP), GET
+// перечитывает эндпоинт и порты, которые Cloudflare вправе менять. device.json
+// живёт в /opt/etc/z2k-warp/ и переживает и реинсталл z2k, и «Удалить»:
+// повторная установка не должна сжигать новое устройство.
+package account
+
+import (
+	"bytes"
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"golang.org/x/crypto/curve25519"
+)
+
+const (
+	// DefaultBaseURL — API регистрации. Десинкается nfqws2 как любой трафик роутера.
+	DefaultBaseURL = "https://api.cloudflareclient.com"
+	// Версия API выбрана по замеру, не по свежести: v0a4471 выдаёт
+	// эндпоинт 162.159.192.x с четырьмя портами — диапазон, который РФ-ISP
+	// режут; v0a2158 — 8.x (anycast) и ~50 запасных портов, и он ходит.
+	apiPath       = "/v0a2158"
+	clientVersion = "a-6.10-2158"
+	userAgent     = "okhttp/3.12.1"
+
+	// Типы ключа/туннеля в API. У одного устройства активен ровно один ключ:
+	// переход на MASQUE — это PATCH того же устройства, не второе устройство.
+	KeyTypeWG     = "curve25519"
+	TunnelWG      = "wireguard"
+	KeyTypeMasque = "secp256r1"
+	TunnelMasque  = "masque"
+
+	// DefaultH2Endpoint — MASQUE-over-HTTP/2 эндпоинт; регистрация его не
+	// отдаёт, значение снято с официального клиента.
+	DefaultH2Endpoint = "162.159.198.2"
+)
+
+// ErrRevoked — устройство больше не известно Cloudflare (401/403/404 на GET).
+var ErrRevoked = errors.New("device revoked")
+
+// HostPorts — один WG-хост и его порты.
+type HostPorts struct {
+	Host  string `json:"host"`
+	Ports []int  `json:"ports"`
+}
+
+// badEndpoint — адрес, с которым туннель не заработает никогда.
+//
+// 162.159.192.0/24 отдаёт v0a4471 (и GET/PATCH любой версии) вместе с четырьмя
+// портами вместо полусотни. РФ-провайдеры этот диапазон режут: WireGuard не
+// получает рукопожатия ни на одном порту, а MASQUE Cloudflare обрывает каждые
+// несколько минут. Снаружи это выглядит хуже, чем отказ: туннель числится
+// живым, трафик уходит и не возвращается.
+//
+// Поле 2026-08-24: tx=314 КБ, rx=248 байт, компьютер без интернета. Починить
+// было нечем — «Удалить WARP» намеренно сохраняет ключ устройства, поэтому
+// переустановка возвращала ту же мёртвую запись.
+func badEndpoint(host string) bool {
+	return strings.HasPrefix(host, "162.159.192.")
+}
+
+// Endpoint — куда подключаться.
+//
+// V4/Ports — WG-эндпоинт из ПЕРВИЧНОЙ регистрации, и он не перезаписывается:
+// измерено, что POST отдаёт 8.x (anycast) с ~50 портами, а GET/PATCH потом
+// отдают 162.159.192.x с четырьмя — диапазон, который РФ-ISP режут, тогда
+// как 8.x принимает тот же ключ и после любых переключений. Всё, что API
+// отдаёт позже, копится в Alt и пробуется после первичного.
+type Endpoint struct {
+	V4    string      `json:"v4"`
+	Ports []int       `json:"ports"`
+	Alt   []HostPorts `json:"alt,omitempty"`
+	H2    string      `json:"h2,omitempty"`
+}
+
+// Step — транспорт, хост и порт; используется лестницей и как last_good.
+type Step struct {
+	Transport string `json:"transport"`
+	Host      string `json:"host,omitempty"`
+	Port      int    `json:"port"`
+}
+
+// H2Key — ключ EC P-256 для MASQUE-h2 (DER, base64) и публичный ключ
+// эндпоинта для пиннинга TLS. Появляется лениво, когда лестница дошла до h2.
+type H2Key struct {
+	PrivateKey string `json:"private_key"`
+	PeerKey    string `json:"peer_key,omitempty"`
+}
+
+// Device — содержимое device.json.
+type Device struct {
+	PrivateKey string   `json:"private_key"`
+	ID         string   `json:"id"`
+	Token      string   `json:"token"`
+	ClientID   string   `json:"client_id"`
+	AddrV4     string   `json:"addr_v4"`
+	AddrV6     string   `json:"addr_v6,omitempty"`
+	PeerKey    string   `json:"peer_key"`
+	Endpoint   Endpoint `json:"endpoint"`
+	Tunnel     string   `json:"tunnel"` // какой ключ сейчас активен у Cloudflare: wireguard | masque
+	Iface      string   `json:"iface,omitempty"`
+	LastGood   *Step    `json:"last_good,omitempty"`
+	H2         *H2Key   `json:"h2,omitempty"`
+	// EndpointRetried — перерегистрация из-за негодного адреса уже была.
+	//
+	// Без этой отметки проверка «адрес плохой → регистрируйся» срабатывает при
+	// КАЖДОМ старте у того, чей API упорно отдаёт 162.159.192.x, и сжигает
+	// лимит устройств Cloudflare. Попытка одноразовая: если и новая запись
+	// пришла негодной, дальше решает человек кнопкой в панели, а не цикл.
+	EndpointRetried bool `json:"endpoint_retried,omitempty"`
+}
+
+// Client — HTTP-клиент API регистрации.
+type Client struct {
+	BaseURL string
+	HTTP    *http.Client
+}
+
+// WithProxy — копия клиента, ходящая через HTTPS-прокси (VPS-релей): для
+// роутеров, у которых api.cloudflareclient.com заблокирован напрямую.
+func (c *Client) WithProxy(proxyURL string) (*Client, error) {
+	u, err := url.Parse(proxyURL)
+	if err != nil {
+		return nil, err
+	}
+	timeout := 25 * time.Second
+	if c.HTTP != nil && c.HTTP.Timeout > 0 {
+		timeout = c.HTTP.Timeout
+	}
+	return &Client{BaseURL: c.BaseURL, HTTP: &http.Client{Timeout: timeout, Transport: &http.Transport{Proxy: http.ProxyURL(u)}}}, nil
+}
+
+func (c *Client) do(ctx context.Context, method, path, token string, body any) (*http.Response, error) {
+	var payload []byte
+	if body != nil {
+		var err error
+		if payload, err = json.Marshal(body); err != nil {
+			return nil, err
+		}
+	}
+	base := c.BaseURL
+	if base == "" {
+		base = DefaultBaseURL
+	}
+	req, err := http.NewRequestWithContext(ctx, method, base+apiPath+path, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("CF-Client-Version", clientVersion)
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	h := c.HTTP
+	if h == nil {
+		h = &http.Client{Timeout: 20 * time.Second}
+	}
+	return h.Do(req)
+}
+
+type regResp struct {
+	ID          string `json:"id"`
+	Token       string `json:"token"`
+	WarpEnabled bool   `json:"warp_enabled"`
+	Config      struct {
+		ClientID  string `json:"client_id"`
+		Interface struct {
+			Addresses struct {
+				V4 string `json:"v4"`
+				V6 string `json:"v6"`
+			} `json:"addresses"`
+		} `json:"interface"`
+		Peers []struct {
+			PublicKey string `json:"public_key"`
+			Endpoint  struct {
+				V4    string `json:"v4"`
+				Host  string `json:"host"`
+				Ports []int  `json:"ports"`
+			} `json:"endpoint"`
+		} `json:"peers"`
+	} `json:"config"`
+}
+
+// apply переносит ответ API в Device. ID/Token берутся только если заполнены
+// (GET отдаёт их тоже, но перезаписывать нечем и незачем). WG-эндпоинт
+// пишется в V4/Ports только при первичной регистрации (initial); дальше
+// новые хосты копятся в Alt — см. Endpoint.
+func (r *regResp) apply(d *Device, initial bool) error {
+	if len(r.Config.Peers) == 0 {
+		return errors.New("registration has no peers")
+	}
+	p := r.Config.Peers[0]
+	if r.ID != "" && d.ID == "" {
+		d.ID, d.Token = r.ID, r.Token
+	}
+	d.ClientID = r.Config.ClientID
+	d.AddrV4 = r.Config.Interface.Addresses.V4
+	d.AddrV6 = r.Config.Interface.Addresses.V6
+	d.PeerKey = p.PublicKey
+	host := p.Endpoint.V4
+	if i := strings.LastIndex(host, ":"); i > 0 {
+		host = host[:i]
+	}
+	if d.Tunnel == TunnelMasque {
+		return nil // эндпоинт MASQUE к WG-лестнице не относится
+	}
+	if initial || d.Endpoint.V4 == "" {
+		d.Endpoint.V4 = host
+		d.Endpoint.Ports = p.Endpoint.Ports
+		return nil
+	}
+	if host == "" || host == d.Endpoint.V4 {
+		return nil
+	}
+	for i, a := range d.Endpoint.Alt {
+		if a.Host == host {
+			d.Endpoint.Alt[i].Ports = p.Endpoint.Ports
+			return nil
+		}
+	}
+	d.Endpoint.Alt = append(d.Endpoint.Alt, HostPorts{Host: host, Ports: p.Endpoint.Ports})
+	return nil
+}
+
+func genKey() (string, error) {
+	var priv [32]byte
+	if _, err := rand.Read(priv[:]); err != nil {
+		return "", err
+	}
+	priv[0] &= 248
+	priv[31] &= 127
+	priv[31] |= 64
+	return base64.StdEncoding.EncodeToString(priv[:]), nil
+}
+
+func pubOf(privB64 string) (string, error) {
+	priv, err := base64.StdEncoding.DecodeString(privB64)
+	if err != nil || len(priv) != 32 {
+		return "", errors.New("bad private key")
+	}
+	pub, err := curve25519.X25519(priv, curve25519.Basepoint)
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(pub), nil
+}
+
+func genECKey() (string, error) {
+	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return "", err
+	}
+	der, err := x509.MarshalECPrivateKey(k)
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(der), nil
+}
+
+// ECPrivateKey разбирает H2-ключ.
+func ECPrivateKey(b64 string) (*ecdsa.PrivateKey, error) {
+	der, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return nil, err
+	}
+	return x509.ParseECPrivateKey(der)
+}
+
+func ecPubOf(privB64 string) (string, error) {
+	k, err := ECPrivateKey(privB64)
+	if err != nil {
+		return "", err
+	}
+	der, err := x509.MarshalPKIXPublicKey(&k.PublicKey)
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(der), nil
+}
+
+// Register заводит новое устройство (POST /reg) и включает warp (PATCH).
+func (c *Client) Register(ctx context.Context) (*Device, error) {
+	priv, err := genKey()
+	if err != nil {
+		return nil, err
+	}
+	pub, err := pubOf(priv)
+	if err != nil {
+		return nil, err
+	}
+	body := map[string]any{
+		"key": pub, "install_id": "", "fcm_token": "",
+		"tos":   time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+		"model": "PC", "serial_number": "", "os_version": "", "locale": "en_US",
+		"key_type": KeyTypeWG, "tunnel_type": TunnelWG,
+	}
+	resp, err := c.do(ctx, "POST", "/reg", "", body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("register: HTTP %d", resp.StatusCode)
+	}
+	var r regResp
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		return nil, err
+	}
+	d := &Device{PrivateKey: priv, Tunnel: TunnelWG, Endpoint: Endpoint{H2: DefaultH2Endpoint}}
+	if err := r.apply(d, true); err != nil {
+		return nil, err
+	}
+	if d.ID == "" || d.Token == "" {
+		return nil, errors.New("register: response without id/token")
+	}
+	if !r.WarpEnabled {
+		if err := c.enableWarp(ctx, d); err != nil {
+			return nil, err
+		}
+	}
+	return d, nil
+}
+
+func (c *Client) enableWarp(ctx context.Context, d *Device) error {
+	resp, err := c.do(ctx, "PATCH", "/reg/"+d.ID, d.Token, map[string]any{"warp_enabled": true})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("enable warp: HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// Refresh перечитывает регистрацию: эндпоинт, порты, адрес могут меняться.
+// Ключ и идентичность устройства не трогает.
+func (c *Client) Refresh(ctx context.Context, d *Device) error {
+	resp, err := c.do(ctx, "GET", "/reg/"+d.ID, d.Token, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case 200:
+	case 401, 403, 404:
+		return ErrRevoked
+	default:
+		return fmt.Errorf("refresh: HTTP %d", resp.StatusCode)
+	}
+	var r regResp
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		return err
+	}
+	return r.apply(d, false)
+}
+
+// SwitchTunnel переключает ключ устройства: masque — на H2-ключ (генерируется,
+// если его нет), wireguard — обратно на X25519. Ответ обновляет эндпоинт и
+// публичный ключ пира.
+func (c *Client) SwitchTunnel(ctx context.Context, d *Device, tunnel string) error {
+	var body map[string]any
+	switch tunnel {
+	case TunnelWG:
+		pub, err := pubOf(d.PrivateKey)
+		if err != nil {
+			return err
+		}
+		body = map[string]any{"key": pub, "key_type": KeyTypeWG, "tunnel_type": TunnelWG}
+	case TunnelMasque:
+		if d.H2 == nil || d.H2.PrivateKey == "" {
+			priv, err := genECKey()
+			if err != nil {
+				return err
+			}
+			d.H2 = &H2Key{PrivateKey: priv}
+		}
+		pub, err := ecPubOf(d.H2.PrivateKey)
+		if err != nil {
+			return err
+		}
+		body = map[string]any{"key": pub, "key_type": KeyTypeMasque, "tunnel_type": TunnelMasque}
+	default:
+		return fmt.Errorf("unknown tunnel %q", tunnel)
+	}
+	resp, err := c.do(ctx, "PATCH", "/reg/"+d.ID, d.Token, body)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case 200:
+	case 401, 403, 404:
+		return ErrRevoked
+	default:
+		return fmt.Errorf("switch tunnel: HTTP %d", resp.StatusCode)
+	}
+	var r regResp
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		return err
+	}
+	d.Tunnel = tunnel
+	if err := r.apply(d, false); err != nil {
+		return err
+	}
+	if tunnel == TunnelMasque {
+		d.H2.PeerKey = d.PeerKey
+	}
+	return nil
+}
+
+// RepairBadEndpoint — перерегистрация записи, которой Cloudflare выдал адрес из
+// диапазона, блокируемого целиком. Возвращает (устройство, была ли
+// перерегистрация, ошибка).
+//
+// ОТДЕЛЬНОЙ ФУНКЦИЕЙ, А НЕ ВНУТРИ Ensure, И ЭТО НЕ ВКУСОВЩИНА. Сначала проверка
+// жила только в Ensure — а Ensure зовётся ИСКЛЮЧИТЕЛЬНО из подкоманды register,
+// то есть при нажатии «Установить WARP». У того, кто установил WARP раньше и
+// больше эту кнопку не трогал, проверка не выполнялась НИ РАЗУ: демон при
+// старте читает device.json напрямую. Починка, до которой нельзя доехать
+// обновлением, — не починка. Теперь её зовёт и старт демона.
+//
+// Признак детерминированный и самоограниченный: новая регистрация плохого
+// диапазона не содержит (замер: на здоровой записи первичный 8.6.112.0, а
+// 162.159.192.x лежит запасным), а флаг EndpointRetried не даёт жечь лимит
+// устройств Cloudflare в цикле.
+func (c *Client) RepairBadEndpoint(ctx context.Context, path string) (*Device, bool, error) {
+	// ОТСУТСТВИЕ device.json — НЕ ОШИБКА. Устройство ещё не заводили, чинить
+	// нечего. Возвращая ошибку, мы заставляли вызывающего писать в журнал
+	// «перерегистрация не удалась (no such file or directory)» на каждом старте
+	// без регистрации — и человек, приславший диагностику, справедливо решил,
+	// что WARP не поднялся именно из-за неё.
+	d, err := Load(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if d.ID == "" {
+		return nil, false, nil
+	}
+	if !badEndpoint(d.Endpoint.V4) || d.EndpointRetried {
+		return d, false, nil
+	}
+	fresh, rerr := c.Register(ctx)
+	if rerr != nil {
+		// Старую запись НЕ трогаем: негодная лучше, чем никакой — с ней хотя бы
+		// виден диагноз, и следующий запуск попробует снова.
+		return d, false, fmt.Errorf("re-register (bad endpoint %s): %w", d.Endpoint.V4, rerr)
+	}
+	fresh.EndpointRetried = true
+	if err := fresh.Save(path); err != nil {
+		return fresh, true, err
+	}
+	c.carryLicense(ctx, path, fresh)
+	return fresh, true, nil
+}
+
+// Ensure — «устройство есть и живо»: существующий device.json проверяется
+// через GET (и обновляется), новое устройство заводится ТОЛЬКО если файла нет
+// или Cloudflare отозвал старое (ErrRevoked). Сетевая ошибка на GET — это
+// ошибка, а не повод регистрироваться заново: лимит устройств на аккаунте
+// конечен, и каждая лишняя регистрация его съедает. Возвращает true, если
+// устройство создано заново.
+func (c *Client) Ensure(ctx context.Context, path string) (*Device, bool, error) {
+	if d, err := Load(path); err == nil && d.ID != "" {
+		// Негодный адрес чиним ДО обращения к API: Refresh его не исправит —
+		// первичный эндпоинт намеренно не перезаписывается (см. Endpoint), а
+		// GET отдаёт как раз тот диапазон, из-за которого запись и мертва.
+		// Признак детерминированный и самоограниченный: новая регистрация
+		// плохого диапазона не содержит, значит второй раз не сработает.
+		//
+		// Именно на старте, а НЕ по факту «туннель не поднялся»: у неудачи
+		// туннеля десяток причин (провайдер, DPI, поезд), и перерегистрация по
+		// такому признаку жгла бы регистрации Cloudflare в цикле у того, у кого
+		// просто плохая сеть.
+		if fresh, done, rerr := c.RepairBadEndpoint(ctx, path); rerr != nil {
+			return nil, false, rerr
+		} else if done {
+			return fresh, true, nil
+		}
+		err := c.Refresh(ctx, d)
+		if err == nil {
+			return d, false, d.Save(path)
+		}
+		if !errors.Is(err, ErrRevoked) {
+			return nil, false, err
+		}
+	}
+	d, err := c.Register(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := d.Save(path); err != nil {
+		return d, true, err
+	}
+	c.carryLicense(ctx, path, d)
+	return d, true, nil
+}
+
+// ---- WARP+: свой ключ лицензии ---------------------------------------------
+//
+// Протокол — тот же, что у wgcf (cloudflare/api.go UpdateLicenseKey и
+// openapi-spec.yml): PUT /reg/{id}/account с {"license": ключ} привязывает
+// устройство к аккаунту, которому принадлежит ключ; GET /reg/{id}/account
+// отдаёт тип аккаунта. Ключ устройства и регистрация при этом не меняются —
+// перерегистрироваться не нужно, туннель тот же. У одного аккаунта не больше
+// пяти активных устройств (так пишет wgcf в описании update).
+//
+// Признак подписки — account_type, а НЕ warp_plus. Замер на роутере владельца
+// 2026-09-14: у бесплатной записи "account_type":"free" и при этом
+// "warp_plus":true — это флаг включённости функции, а не оплаченный аккаунт.
+
+// AccountInfo — то, что о привязанном аккаунте нужно панели. Ключ здесь не
+// хранится: файл с этой сводкой читает панель, а ключ — секрет.
+type AccountInfo struct {
+	AccountType string  `json:"account_type"`
+	PremiumData float64 `json:"premium_data"`
+	Quota       float64 `json:"quota"`
+	Checked     int64   `json:"checked"`
+	// Error — ключ сохранён, но к устройству не привязался (новая регистрация
+	// после починки адреса). Без этого поля панель показала бы «бесплатный» и
+	// не объяснила бы, куда делся WARP+.
+	Error string `json:"error,omitempty"`
+}
+
+// Plus — оплаченный аккаунт (WARP+ с лимитом, безлимитный или Zero Trust).
+func (a *AccountInfo) Plus() bool {
+	switch a.AccountType {
+	case "limited", "unlimited", "team":
+		return true
+	}
+	return false
+}
+
+// APIError — отказ API с текстом Cloudflare, если он его прислал: «ключ
+// неверный» и «лимит устройств» человеку нужно увидеть словами, а не кодом.
+type APIError struct {
+	Op      string
+	Status  int
+	Message string
+}
+
+func (e *APIError) Error() string {
+	if e.Message != "" {
+		return fmt.Sprintf("%s: HTTP %d: %s", e.Op, e.Status, e.Message)
+	}
+	return fmt.Sprintf("%s: HTTP %d", e.Op, e.Status)
+}
+
+func apiError(op string, resp *http.Response) error {
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	var env struct {
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	msg := ""
+	if json.Unmarshal(b, &env) == nil {
+		var parts []string
+		for _, e := range env.Errors {
+			if e.Message != "" {
+				parts = append(parts, e.Message)
+			}
+		}
+		msg = strings.Join(parts, "; ")
+	}
+	return &APIError{Op: op, Status: resp.StatusCode, Message: msg}
+}
+
+// Account читает тип аккаунта, к которому привязано устройство.
+func (c *Client) Account(ctx context.Context, d *Device) (*AccountInfo, error) {
+	resp, err := c.do(ctx, "GET", "/reg/"+d.ID+"/account", d.Token, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case 200:
+	case 401, 403, 404:
+		return nil, ErrRevoked
+	default:
+		return nil, apiError("account", resp)
+	}
+	var a AccountInfo
+	if err := json.NewDecoder(resp.Body).Decode(&a); err != nil {
+		return nil, err
+	}
+	return &a, nil
+}
+
+// ApplyLicense привязывает устройство к аккаунту ключа и возвращает, каким
+// аккаунт стал.
+func (c *Client) ApplyLicense(ctx context.Context, d *Device, key string) (*AccountInfo, error) {
+	resp, err := c.do(ctx, "PUT", "/reg/"+d.ID+"/account", d.Token, map[string]any{"license": key})
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, apiError("license", resp)
+	}
+	return c.Account(ctx, d)
+}
+
+// LicensePath — где лежит ключ: рядом с device.json, режим 0600.
+//
+// ОТДЕЛЬНЫМ ФАЙЛОМ, А НЕ ПОЛЕМ В device.json. Запись устройства заменяется
+// целиком при перерегистрации (кнопка в панели, починка негодного адреса), и
+// ключ, живший внутри неё, пропадал бы вместе со старой записью — человек
+// молча оказывался бы на бесплатном аккаунте.
+func LicensePath(devicePath string) string {
+	return filepath.Join(filepath.Dir(devicePath), "license")
+}
+
+// AccountInfoPath — сводка об аккаунте для панели, без секретов.
+func AccountInfoPath(devicePath string) string {
+	return filepath.Join(filepath.Dir(devicePath), "account.json")
+}
+
+// LoadLicense — сохранённый ключ или пустая строка.
+func LoadLicense(devicePath string) string {
+	b, err := os.ReadFile(LicensePath(devicePath))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+func writeAtomic(path string, b []byte, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, mode); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// SaveLicense запоминает ключ.
+func SaveLicense(devicePath, key string) error {
+	return writeAtomic(LicensePath(devicePath), []byte(key+"\n"), 0600)
+}
+
+// SaveAccountInfo пишет сводку для панели.
+func SaveAccountInfo(devicePath string, a *AccountInfo) error {
+	b, err := json.Marshal(a)
+	if err != nil {
+		return err
+	}
+	return writeAtomic(AccountInfoPath(devicePath), b, 0644)
+}
+
+// carryLicense — новое устройство (регистрация заново) привязывается к
+// сохранённому ключу. Отказ не валит регистрацию: туннель на бесплатном
+// аккаунте лучше, чем никакого, а причина ляжет в сводку для панели.
+func (c *Client) carryLicense(ctx context.Context, path string, d *Device) {
+	key := LoadLicense(path)
+	if key == "" {
+		return
+	}
+	a, err := c.ApplyLicense(ctx, d, key)
+	if err != nil {
+		_ = SaveAccountInfo(path, &AccountInfo{AccountType: "free", Checked: time.Now().Unix(), Error: err.Error()})
+		return
+	}
+	a.Checked = time.Now().Unix()
+	_ = SaveAccountInfo(path, a)
+}
+
+// Reserved — три байта client_id, которые несёт заголовок каждого WG-пакета.
+func (d *Device) Reserved() ([3]byte, error) {
+	var r [3]byte
+	b, err := base64.StdEncoding.DecodeString(d.ClientID)
+	if err != nil || len(b) < 3 {
+		return r, errors.New("bad client_id")
+	}
+	copy(r[:], b[:3])
+	return r, nil
+}
+
+// Load читает device.json.
+func Load(path string) (*Device, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var d Device
+	if err := json.Unmarshal(b, &d); err != nil {
+		return nil, err
+	}
+	return &d, nil
+}
+
+// Save пишет атомарно (tmp + rename), режим 0600.
+func (d *Device) Save(path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	b, err := json.MarshalIndent(d, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}

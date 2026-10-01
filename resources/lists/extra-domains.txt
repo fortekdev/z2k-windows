@@ -1,0 +1,57 @@
+
+#
+# (cf-assets.www, dash, workers, developers, community, support, radar,
+# blog, partnerlocator, playground.ai, status, canto, и т.д.).
+# Cloudflare-инфраструктура — официально в РФ не заблокирована, но ТСПУ
+# Tapo IoT cameras — Mosline (МО) DPI режет
+# TLS handshake к их облаку. Камеры не видны наружу пока home-облако TP-Link
+# z2k extra domains — дополнения к RKN-списку из runetfreedom.
+# в default profile с одной слабой fake-стратегией. nfqws2 hostlist
+# жалуются что сайт не открывается без z2k обработки.
+# Критерий: домен НЕ покрыт runetfreedom ru-blocked, но пользователи
+# на multiplexed HTTP/2 stream'ах). Без явного матча CF-домены падают
+# недоступно.
+# Нишевые/региональные сайты от Святого отца
+# Обновляется при каждой установке z2k.
+# режет длинные TLS-потоки (16KB window_update инжект, селективный stall
+# Торренты
+# хиерархический — `cloudflare.com` покрывает все *.cloudflare.com
+bible-center.ru
+cdnbase.com
+cloudflare.com
+cloudflare.net
+cloudflare.tv
+cloudflarepartners.com
+cloudflarestatus.com
+dnsleaktest.com
+enimerosi.com
+euw1-device-cloudgateway.iot.i.tplinknbu.com
+fast-torrent.ru
+katzauction.com
+mcpmarket.com
+nnm-club.me
+nnmclub.to
+nnmstatic.win
+numista.com
+rua.gr
+ru-board.com
+searchtor.to
+security.iot.i.tplinknbu.com
+# SoundCloud: сайт и sndcdn.com есть в списке РКН, а музыка идёт с нового домена
+# soundcloud.cloud (playback.media-streaming — список и куски трека, assets.web —
+# ресурсы плеера), которого там нет. Без обработки поток вставал ровно на 16 КБ,
+# и трек не играл. Замер 15.09.2026 на роутере владельца: до — 16 122 байта за
+# 20 с, после добавления — список 19 КБ и кусок 200 КБ за 0,4 с.
+soundcloud.cloud
+# Amazon CloudFront и AWS: на них живут медиа и API многих сервисов (SoundCloud,
+# Discord, часть игр), и блок по объёму режет их так же, как всё остальное.
+# Добавлены по указанию владельца 15.09.2026.
+amazonaws.com
+cloudfront.net
+tapo.com
+mailsuite.com
+# Подкасты Apple: страница открывается с хостов Apple, а звук идёт с
+# audio.thisisdistorted.com (AS20860, Iomart). Эта сеть режет поток по
+# объёму на 16 КБ — страница есть, выпуск не играет. Лечится подстановкой
+# имени (см. files/lua/z2k-tcp16.lua), но профиль обязан до хоста дотянуться.
+thisisdistorted.com

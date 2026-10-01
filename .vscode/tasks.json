@@ -1,0 +1,59 @@
+{
+  // F5 (launch.json → preLaunchTask "dev: build all") поднимает два фоновых процесса в отдельных терминалах.
+  // Они продолжают работать после закрытия окна приложения: повторный F5 переиспользует их (дубликатов нет).
+  // Остановить: Terminal → Terminate Task… (или корзина у терминала).
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "dev: renderer (Next.js)",
+      "type": "npm",
+      "script": "dev:renderer",
+      "isBackground": true,
+      "runOptions": { "instanceLimit": 1 },
+      "presentation": { "reveal": "always", "panel": "dedicated", "group": "z2k-dev", "clear": true },
+      "problemMatcher": {
+        "owner": "next",
+        "source": "next",
+        "fileLocation": ["relative", "${workspaceFolder}"],
+        // ⨯ ./renderer/app/page.tsx:1:1
+        // Error: Module not found: Can't resolve './nope'
+        "pattern": [
+          { "regexp": "^\\s*(?:⨯\\s+)?(\\./\\S+?):(\\d+):(\\d+)\\s*$", "file": 1, "line": 2, "column": 3 },
+          { "regexp": "^(?:Error:\\s*)?(.+)$", "message": 1 }
+        ],
+        "background": {
+          "activeOnStart": true,
+          // "▲ Next.js 16.3.8 (Turbopack)" … "✓ Ready in 236ms" (scripts/dev-renderer.mjs печатает такие же строки при переиспользовании)
+          "beginsPattern": "Next\\.js \\d+\\.\\d+",
+          "endsPattern": "Ready in \\d"
+        }
+      }
+    },
+    {
+      "label": "dev: main (esbuild watch)",
+      "type": "npm",
+      "script": "watch:electron",
+      "isBackground": true,
+      "runOptions": { "instanceLimit": 1 },
+      "presentation": { "reveal": "always", "panel": "dedicated", "group": "z2k-dev", "clear": true },
+      "problemMatcher": {
+        "owner": "esbuild",
+        "source": "esbuild",
+        "fileLocation": ["relative", "${workspaceFolder}"],
+        // scripts/build-electron.mjs --watch печатает ошибки в виде "file:line:col: error: text"
+        "pattern": { "regexp": "^(.+?):(\\d+):(\\d+): error: (.*)$", "file": 1, "line": 2, "column": 3, "message": 4 },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "^\\[watch\\] build started",
+          "endsPattern": "^\\[watch\\] build finished \\(\\d+ errors\\)"
+        }
+      }
+    },
+    {
+      "label": "dev: build all",
+      "dependsOn": ["dev: main (esbuild watch)", "dev: renderer (Next.js)"],
+      "dependsOrder": "parallel",
+      "problemMatcher": []
+    }
+  ]
+}

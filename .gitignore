@@ -1,0 +1,13 @@
+node_modules/
+dist-electron/
+renderer/.next/
+renderer/out/
+release/
+.tmp/
+.tmp-userdata/
+*.log
+.tools/
+
+# копия исходного репозитория z2k (нужное уже перенесено в resources/)
+z2k-z2k-enhanced/
+*.tsbuildinfo

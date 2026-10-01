@@ -1,0 +1,92 @@
+{
+  "name": "z2k-windows",
+  "productName": "z2k Windows",
+  "version": "0.1.0",
+  "description": "Обход DPI-блокировок для Windows (порт z2k/zapret2): автоподбор стратегий и локальный Telegram-прокси",
+  "author": "Rubot.Cloud",
+  "license": "MIT",
+  "private": true,
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "dev": "concurrently -k -n next,electron \"npm:dev:renderer\" \"npm:dev:electron\"",
+    "dev:renderer": "node scripts/dev-renderer.mjs",
+    "dev:electron": "node scripts/build-electron.mjs && wait-on http-get://localhost:3123 && cross-env Z2K_DEV=1 electron .",
+    "build:renderer": "next build renderer",
+    "build:electron": "node scripts/build-electron.mjs --prod",
+    "build": "node scripts/check-resources.mjs && npm run build:app && electron-builder --win portable --x64 && node scripts/clean-release.mjs",
+    "fetch:engine": "node scripts/fetch-engine.mjs",
+    "typecheck": "tsc -p electron --noEmit && tsc -p renderer --noEmit",
+    "test": "node scripts/run-tests.mjs",
+    "start": "electron .",
+    "dist": "npm run build",
+    "watch:electron": "node scripts/build-electron.mjs --watch",
+    "dist:dir": "node scripts/check-resources.mjs && npm run build:app && electron-builder --win --x64 --dir",
+    "build:warpd": "node scripts/build-warpd.mjs",
+    "build:tgredir": "node scripts/build-tgredir.mjs",
+    "build:relay": "node scripts/build-relay.mjs",
+    "build:app": "node scripts/gen-icon.mjs && npm run build:renderer && npm run build:electron"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.3",
+    "@types/node": "^26.6.3",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@types/ws": "^8.18.2",
+    "concurrently": "^10.0.5",
+    "cross-env": "^10.1.0",
+    "electron": "^44.5.1",
+    "electron-builder": "^26.15.3",
+    "esbuild": "^0.28.2",
+    "lucide-react": "^1.49.0",
+    "next": "^16.3.8",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^7.0.2",
+    "wait-on": "^9.5.1",
+    "ws": "^8.22.0"
+  },
+  "build": {
+    "appId": "z2k.windows",
+    "productName": "z2k Windows",
+    "copyright": "© 2026 Rubot.Cloud",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist-electron/**/*",
+      "!dist-electron/**/*.map",
+      "renderer/out/**/*",
+      "build/icon.ico",
+      "build/tray-*.png",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "resources",
+        "to": "engine",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "asar": true,
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico",
+      "requestedExecutionLevel": "requireAdministrator"
+    },
+    "portable": {
+      "artifactName": "z2k-windows-${version}-portable.${ext}"
+    },
+    "compression": "store"
+  }
+}

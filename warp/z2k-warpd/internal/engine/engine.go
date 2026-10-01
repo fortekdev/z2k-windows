@@ -1,0 +1,557 @@
+// Package engine — главный цикл z2k-warpd: device.json → TUN → NAT →
+// лестница транспортов → liveness → status.json. Всё, что можно подменить
+// в тестах (часы, сон, транспорты, TUN, команды), приходит через Config.
+package engine
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"time"
+
+	"golang.zx2c4.com/wireguard/tun"
+
+	"github.com/necronicle/z2k/z2k-warpd/internal/account"
+	"github.com/necronicle/z2k/z2k-warpd/internal/edgepick"
+	"github.com/necronicle/z2k/z2k-warpd/internal/health"
+	"github.com/necronicle/z2k/z2k-warpd/internal/ladder"
+	"github.com/necronicle/z2k/z2k-warpd/internal/nat"
+	"github.com/necronicle/z2k/z2k-warpd/internal/status"
+	"github.com/necronicle/z2k/z2k-warpd/internal/transport"
+	"github.com/necronicle/z2k/z2k-warpd/internal/tundev"
+	"github.com/necronicle/z2k/z2k-warpd/internal/tunshare"
+)
+
+const (
+	// MTU — одно значение для обоих транспортов: смена транспорта без
+	// пересоздания TUN. 1280 — потолок h2 (нет PMTU, движок режет по буферу).
+	MTU         = 1280
+	openTimeout = 15 * time.Second
+	tick        = time.Second
+	// tunOffset — запас перед пакетом, который просят транспорты (virtio-заголовок).
+	tunOffset = 16
+)
+
+// TransportFactory строит транспорт под шаг лестницы.
+type TransportFactory func(step account.Step, dev tun.Device, d *account.Device) (transport.Transport, error)
+
+// Config — зависимости движка.
+type Config struct {
+	DevicePath     string
+	StatusPath     string
+	LockPath       string        // пусто = рядом со status.json
+	TunName        string        // пусто = d.Iface или первый свободный z2ktunN (Windows: имя адаптера Wintun)
+	ForceStep      *account.Step // --force-transport: лестница из одного шага
+	Mode           string        // --transport: ladder.ModeAuto / ModeWG / ModeH2
+	Logf           func(string, ...any)
+	EdgeCandidates []account.Step
+	EdgeCachePath  string
+	GeoProbe       func(context.Context, string) (edgepick.Meta, time.Duration, int, error)
+	EdgeWAN        func(string) (string, error)
+
+	Now          func() time.Time
+	Sleep        func(ctx context.Context, d time.Duration) error
+	NewTransport TransportFactory
+	CreateTUN    func(name string, mtu int) (tun.Device, error)
+	Run          tundev.Runner
+	Probe        health.Prober
+	SwitchTunnel func(ctx context.Context, d *account.Device, tunnel string) error
+	// Proxy — VPS-релей для API, если напрямую заблокирован (как у register).
+	Proxy string
+	Tick  time.Duration
+}
+
+func (c *Config) defaults() {
+	if c.Logf == nil {
+		c.Logf = func(string, ...any) {}
+	}
+	if c.Now == nil {
+		c.Now = time.Now
+	}
+	if c.Sleep == nil {
+		c.Sleep = func(ctx context.Context, d time.Duration) error {
+			t := time.NewTimer(d)
+			defer t.Stop()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-t.C:
+				return nil
+			}
+		}
+	}
+	if c.CreateTUN == nil {
+		c.CreateTUN = tundev.Create
+	}
+	if c.Run == nil {
+		c.Run = tundev.Exec
+	}
+	if c.Probe == nil {
+		c.Probe = health.TraceProbe(8 * time.Second)
+	}
+	if c.GeoProbe == nil {
+		c.GeoProbe = edgepick.Probe
+	}
+	if c.EdgeWAN == nil {
+		c.EdgeWAN = edgepick.WANFor
+	}
+	if c.EdgeCachePath == "" {
+		c.EdgeCachePath = "/opt/etc/z2k-warp/edge-cache.json"
+	}
+	if c.SwitchTunnel == nil {
+		api := &account.Client{HTTP: &http.Client{Timeout: 25 * time.Second}}
+		proxy := c.Proxy
+		logf := c.Logf
+		// Подмена ключа — это вызов API. На роутере, где API заблокирован
+		// DPI, прямой PATCH не пройдёт, и без запасного пути h2-шаг умирал
+		// ещё до транспорта — с тем же вердиктом no_endpoint, что и настоящий
+		// полный блок. Тот же релей, что у регистрации.
+		c.SwitchTunnel = func(ctx context.Context, d *account.Device, tunnel string) error {
+			err := api.SwitchTunnel(ctx, d, tunnel)
+			if err == nil || errors.Is(err, account.ErrRevoked) || proxy == "" {
+				return err
+			}
+			logf("api: direct switch to %s failed (%v) — retrying via relay", tunnel, err)
+			relay, perr := api.WithProxy(proxy)
+			if perr != nil {
+				return err
+			}
+			return relay.SwitchTunnel(ctx, d, tunnel)
+		}
+	}
+	if c.Tick == 0 {
+		c.Tick = tick
+	}
+}
+
+// Engine — состояние одного запуска.
+type Engine struct {
+	cfg         Config
+	d           *account.Device
+	st          *status.Writer
+	tunDev      *tunshare.Shared
+	iface       string
+	ifIndex     int       // Windows: индекс адаптера; 0 на Linux
+	ifLUID      uint64    // Windows: LUID адаптера; 0 на Linux
+	probeStack  io.Closer // Windows: userspace-стек проб (probe_windows.go)
+	keepStatus  bool      // не удалять status.json на выходе (addr_conflict)
+	since       time.Time
+	lastErr     string // причина держится до первого успеха, а не до следующей записи
+	scanning    bool
+	currentStep account.Step
+	edges       map[account.Step]edgepick.Result
+}
+
+// Run выполняет цикл до отмены ctx. Возвращает ошибку только для
+// невосстановимых состояний (нет device.json, нет TUN).
+func Run(ctx context.Context, cfg Config) error {
+	cfg.defaults()
+	// Замок ДО всего: пока он не наш, мы не трогаем ни TUN, ни status.json —
+	// иначе обречённый второй экземпляр сносит состояние живого первого.
+	lockPath := cfg.LockPath
+	if lockPath == "" {
+		lockPath = filepath.Join(filepath.Dir(cfg.StatusPath), "warpd.lock")
+	}
+	release, err := acquireLock(lockPath)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	e := &Engine{cfg: cfg, st: &status.Writer{Path: cfg.StatusPath, MinInterval: time.Second}, since: cfg.Now()}
+	defer func() {
+		if !e.keepStatus {
+			e.st.Remove()
+		}
+	}()
+
+	d, err2 := account.Load(cfg.DevicePath)
+	err = err2
+	if err != nil {
+		e.write(status.Status{LastError: status.ErrRegisterBlocked})
+		e.st.Flush()
+		return fmt.Errorf("device.json: %w", err)
+	}
+	e.d = d
+	e.scanning = cfg.ForceStep == nil && cfg.Mode != ladder.ModeH2 && len(cfg.EdgeCandidates) > 0
+
+	if err := e.bringUpTUN(); err != nil {
+		code := status.ErrTunFailed
+		var conflict *tundev.AddrConflictError
+		if errors.As(err, &conflict) {
+			code = status.ErrAddrConflict
+			e.keepStatus = true
+			cfg.Logf("%s", conflict.Error())
+		}
+		e.write(status.Status{LastError: code})
+		e.st.Flush()
+		return err
+	}
+	defer e.tearDownTUN()
+
+	// Статус пишем СРАЗУ, ещё до первой ступени: обход лестницы занимает
+	// десятки секунд, а до этой строки status.json не существовал вовсе — и
+	// панель, диагностика и selfheal всё это время читали «движок не
+	// запущен» вместо «поднимается» (поле r-79.4).
+	e.write(status.Status{Ready: false, Iface: e.iface, Addr: d.AddrV4, HandshakeAge: -1})
+	e.st.Flush()
+
+	// MSS считаем от MTU туннеля, а не вписываем числом: два числа в разных
+	// местах разъедутся при первой же смене MTU. 20 байт IP плюс 20 TCP.
+	if err := nat.Ensure(nat.Runner(cfg.Run), e.iface, MTU-40); err != nil {
+		cfg.Logf("nat: %v", err)
+	}
+	defer nat.Remove(nat.Runner(cfg.Run), e.iface, MTU-40)
+
+	var lad *ladder.Ladder
+	if cfg.ForceStep != nil {
+		fs := *cfg.ForceStep
+		if fs.Transport == "wg" && fs.Host == "" {
+			fs.Host = d.Endpoint.V4
+		}
+		lad = ladder.NewFixed(fs)
+	} else {
+		verified := e.scanEdges(ctx)
+		e.scanning = false
+		e.edges = make(map[account.Step]edgepick.Result, len(verified))
+		for _, result := range verified {
+			e.edges[result.Step] = result
+		}
+		preferred := make([]account.Step, 0, len(verified))
+		for _, result := range edgepick.Rank(verified) {
+			preferred = append(preferred, result.Step)
+		}
+		lad = ladder.NewPreferred(d.Endpoint, d.LastGood, cfg.Mode, preferred)
+	}
+	mon := &health.Monitor{Probe: cfg.Probe, Doubt: 30 * time.Second, Fails: 2,
+		ProveEvery: 3 * time.Second, ConfirmSuccesses: 2, CheckEvery: 20 * time.Second}
+
+	for ctx.Err() == nil {
+		step := lad.Current()
+		e.currentStep = step
+		e.write(status.Status{Ready: false, Transport: step.Transport, Endpoint: ladder.Label(step),
+			Iface: e.iface, Addr: d.AddrV4, HandshakeAge: -1, LadderStep: lad.Index()})
+		tr, err := e.open(ctx, step, e.tunDev.Handle())
+		if err != nil {
+			cfg.Logf("ladder: %s failed: %v", ladder.Label(step), err)
+			if !e.advance(ctx, lad, status.ErrNoEndpoint) {
+				return nil
+			}
+			continue
+		}
+		// ПРИЧИНУ СНИМАЕТ ДОКАЗАННАЯ ЖИВОСТЬ, А НЕ ОТКРЫТАЯ СЕССИЯ.
+		//
+		// Здесь стояло e.lastErr = "" сразу после open — и на линии, где каждая
+		// ступень встаёт, но ни одна не возит, статус мигал: no_transit жил
+		// микросекунды до следующего open, а status.Writer отдаёт наружу не
+		// чаще раза в секунду и просто терял его. Панель показывала пустую
+		// причину, то есть «поднимается», ровно в том случае, ради которого
+		// no_transit и заведён. Снимаем причину там же, где фиксируем рабочую
+		// ступень, — по доказанной пробе.
+		e.since = cfg.Now()
+		mon.Reset()
+		cfg.Logf("ladder: %s ok (%s)", ladder.Label(step), tr.Endpoint())
+		retop := e.serve(ctx, tr, step, lad, mon)
+		tr.Close()
+		// Вернулись на вершину лестницы сами (h2 → WG снова доступен) — шаг
+		// уже выбран, и Next() тут сдвинул бы нас МИМО него.
+		if ctx.Err() != nil || retop {
+			continue
+		}
+		reason := e.lastErr
+		if reason == "" {
+			reason = status.ErrNoEndpoint
+		}
+		if !e.advance(ctx, lad, reason) {
+			return nil
+		}
+	}
+	return nil
+}
+
+// advance переходит к следующей ступени и, если круг пройден целиком,
+// выдерживает кулдаун. Возвращает false, если ждать больше не нужно (ctx).
+//
+// КУЛДАУН ОБЯЗАН РАБОТАТЬ И ПОСЛЕ serve, А НЕ ТОЛЬКО ПОСЛЕ open. Раньше
+// возврат Next() в этой ветке просто выбрасывался: на линии, где КАЖДАЯ
+// ступень встаёт и НИ ОДНА не возит, круг закрывался, кулдаун вычислялся — и
+// уходил в никуда. Движок молотил всю лестницу по кругу без единой паузы,
+// поднимая по рукопожатию на каждую ступень, круглосуточно.
+func (e *Engine) advance(ctx context.Context, lad *ladder.Ladder, reason string) bool {
+	_, wait := lad.Next(e.cfg.Now())
+	if wait <= 0 {
+		return true
+	}
+	e.cfg.Logf("ladder: full pass failed, next try in %s", wait.Round(time.Second))
+	e.lastErr = reason
+	e.write(status.Status{LastError: reason, LadderStep: lad.Index()})
+	return e.cfg.Sleep(ctx, wait) == nil
+}
+
+// commitGood запоминает шаг как рабочий.
+//
+// ТОЛЬКО ПО ДОКАЗАННОЙ ЖИВОСТИ, и это не педантизм. Раньше вызов стоял сразу
+// после open, то есть по факту рукопожатия, — и роутер запоминал как «рабочий»
+// шаг, который встаёт, но не возит (поле 2026-08-27: wg:188.114.97.1:4500,
+// handshake ok, TCP не проходит). Каждый следующий старт начинал ровно с него,
+// и лестница до остальных ступеней не доходила НИКОГДА.
+//
+// Тем же вызовом сбрасывалась и память о проходе (Ladder.Good), поэтому на
+// линии, где ВСЕ ступени встают и ни одна не возит, круг никогда не считался
+// пройденным и пятиминутный кулдаун не наступал: движок молотил лестницу без
+// пауз — ровно то, против чего кулдаун и введён.
+//
+// Форсированный шаг — отладка, а не опыт: память не трогаем, иначе один прогон
+// с --force-transport h2 пинил бы роутер на h2.
+func (e *Engine) commitGood(lad *ladder.Ladder) {
+	// Причину снимаем ДО сторожа форса: под --force-transport память лестницы
+	// мы намеренно не трогаем, но живой транспорт остаётся живым — иначе
+	// no_transit висел бы в статусе вечно на отладочном прогоне.
+	e.lastErr = ""
+	if e.cfg.ForceStep != nil {
+		return
+	}
+	// MASQUE, выбранный вручную, в память тоже не пишется. Иначе после
+	// возврата в автомат лестница стартовала бы с h2 — ровно с того, от чего
+	// человек, вернувшись в автомат, и хотел уйти. WireGuard записывать можно:
+	// его ступени есть и в автоматической лестнице.
+	if e.cfg.Mode == ladder.ModeH2 {
+		return
+	}
+	good := lad.Good()
+	e.d.LastGood = &good
+	if err := e.d.Save(e.cfg.DevicePath); err != nil {
+		e.cfg.Logf("device.json: %v", err)
+	}
+}
+
+// open строит и открывает транспорт шага, переключая ключ устройства,
+// если у Cloudflare активен ключ другого типа.
+func (e *Engine) open(ctx context.Context, step account.Step, dev tun.Device) (transport.Transport, error) {
+	tr, err := e.openOnce(ctx, step, dev, false)
+	if err == nil || !errors.Is(err, transport.ErrNotEnrolled) {
+		return tr, err
+	}
+	// Ключ, записанный у нас, Cloudflare не знает: device.json говорит
+	// «masque», а на сервере зарегистрирован другой ключ (прерванная смена
+	// транспорта, гонка, откат). Обычный путь сюда не заглядывает — он
+	// меняет ключ, только если ТИП не совпал, — и роутер оставался в
+	// «access denied» навсегда (поле r-79.4). Перерегистрируем тот же ключ.
+	e.cfg.Logf("api: ключ не зарегистрирован — перерегистрирую и пробую снова")
+	return e.openOnce(ctx, step, dev, true)
+}
+
+// openOnce строит и открывает транспорт; force — сменить ключ даже если тип
+// в device.json уже совпадает.
+func (e *Engine) openOnce(ctx context.Context, step account.Step, dev tun.Device, force bool) (transport.Transport, error) {
+	want := account.TunnelWG
+	if step.Transport == "h2" {
+		want = account.TunnelMasque
+	}
+	if force || e.d.Tunnel != want {
+		if err := e.cfg.SwitchTunnel(ctx, e.d, want); err != nil {
+			if errors.Is(err, account.ErrRevoked) {
+				e.lastErr = status.ErrDeviceRevoked
+				e.write(status.Status{LastError: status.ErrDeviceRevoked, Iface: e.iface})
+			}
+			return nil, fmt.Errorf("switch key to %s: %w", want, err)
+		}
+		if err := e.d.Save(e.cfg.DevicePath); err != nil {
+			e.cfg.Logf("device.json: %v", err)
+		}
+	}
+	tr, err := e.cfg.NewTransport(step, dev, e.d)
+	if err != nil {
+		return nil, err
+	}
+	octx, cancel := context.WithTimeout(ctx, openTimeout)
+	defer cancel()
+	if err := tr.Open(octx); err != nil {
+		tr.Close()
+		return nil, err
+	}
+	return tr, nil
+}
+
+// serve держит транспорт, пока монитор не скажет Dead или не отменят ctx.
+// На h2 раз в ProbeUpEvery пробует вернуться на WG. Возвращает true, если
+// вышел из-за возврата на вершину лестницы (шаг уже выбран, Next() не нужен).
+func (e *Engine) serve(ctx context.Context, tr transport.Transport, step account.Step, lad *ladder.Ladder, mon *health.Monitor) bool {
+	lastUp := e.cfg.Now()
+	committed := false
+	for {
+		now := e.cfg.Now()
+		h := tr.Health()
+		v := mon.Assess(ctx, h, now, e.iface)
+		// ГОТОВНОСТЬ — ТОЛЬКО ДОКАЗАННАЯ. Раньше здесь стояло просто
+		// «не мёртв», и туннель объявлялся готовым, едва встала сессия.
+		// В поле это выглядело так: ready=true, transport=h2, tx=314319 при
+		// rx=248 — маршруты подняты, трафик в никуда, и так пять минут, пока
+		// не пришёл EOF. Проба не срабатывала, потому что rx ПОДТЕКАЛ: любой
+		// его рост сбрасывает счётчик сомнения, и тридцатисекундное окно не
+		// истекает никогда.
+		//
+		// Doubtful у доказанного туннеля готовности НЕ снимает — иначе
+		// маршрут снимался бы при каждой паузе в трафике.
+		e.write(status.Status{
+			Ready:        v != health.Dead && mon.Proven(),
+			Transport:    step.Transport,
+			Endpoint:     tr.Endpoint(),
+			Iface:        e.iface,
+			Addr:         e.d.AddrV4,
+			HandshakeAge: h.HandshakeAge(now),
+			Rx:           h.Rx,
+			Tx:           h.Tx,
+			LadderStep:   lad.Index(),
+			Since:        e.since.Unix(),
+		})
+		if !committed && mon.Proven() {
+			committed = true
+			e.commitGood(lad)
+		}
+		if v == health.Dead {
+			// Причина — из транспорта, если она там есть, иначе из монитора:
+			// на пути через пробу transport.Health.Err всегда nil, и печатать
+			// его значило печатать «dead (<nil>)» — строку без содержания.
+			reason := h.Err
+			if reason == nil {
+				reason = mon.Err()
+			}
+			e.cfg.Logf("health: %s dead (%v)", ladder.Label(step), reason)
+			// Сессия ВСТАЁТ, но не возит — это не «поднимается» и не «ни один
+			// адрес не отвечает». Отдельный код, иначе панель и диагностика
+			// показывают пустую причину и человек читает её как «ещё грузится».
+			if h.Err == nil && !mon.Proven() {
+				e.lastErr = status.ErrNoTransit
+			}
+			return false
+		}
+		// Проба «не вернулся ли WireGuard» — только в автомате. В режиме MASQUE
+		// она уводила бы туннель с выбранного транспорта каждые десять минут.
+		if lad.OnH2() && e.cfg.ForceStep == nil && e.cfg.Mode == ladder.ModeAuto && now.Sub(lastUp) >= ladder.ProbeUpEvery {
+			lastUp = now
+			if e.wgReachable(ctx) {
+				e.cfg.Logf("ladder: WireGuard reachable again — leaving h2")
+				lad.Top()
+				return true
+			}
+		}
+		if err := e.cfg.Sleep(ctx, e.cfg.Tick); err != nil {
+			return false
+		}
+	}
+}
+
+// wgReachable пробует WG-handshake на пустом TUN. Ключ на время пробы
+// переключается на WG и возвращается на MASQUE при провале.
+func (e *Engine) wgReachable(ctx context.Context) bool {
+	nt := newNullTun(MTU)
+	defer nt.Close()
+	tr, err := e.open(ctx, account.Step{Transport: "wg", Host: e.d.Endpoint.V4, Port: 2408}, nt)
+	if err != nil {
+		if e.d.Tunnel != account.TunnelMasque {
+			if err := e.cfg.SwitchTunnel(ctx, e.d, account.TunnelMasque); err == nil {
+				_ = e.d.Save(e.cfg.DevicePath)
+			}
+		}
+		return false
+	}
+	tr.Close()
+	return true
+}
+
+func (e *Engine) bringUpTUN() error {
+	name := e.cfg.TunName
+	if name == "" {
+		name = e.d.Iface
+	}
+	if name == "" {
+		name = tundev.PickName(func(n string) bool { return tundev.Exists(e.cfg.Run, n) })
+	}
+	dev, err := e.cfg.CreateTUN(name, MTU)
+	if err != nil {
+		return fmt.Errorf("tun %s: %w", name, err)
+	}
+	if err := tundev.ConfigureDevice(e.cfg.Run, dev, name, e.d.AddrV4, MTU); err != nil {
+		dev.Close()
+		return fmt.Errorf("tun %s: %w", name, err)
+	}
+	alias, ifIndex, ifLUID := tundev.Info(dev, name)
+	e.ifIndex, e.ifLUID = ifIndex, ifLUID
+	if alias != "" && alias != name {
+		e.cfg.Logf("tun: адаптер получил имя %q вместо %q", alias, name)
+		name = alias
+	}
+	e.tunDev, e.iface = tunshare.New(dev, MTU, tunOffset), name
+	if err := e.attachProbeStack(e.d.AddrV4); err != nil {
+		e.tunDev.Close()
+		e.tunDev = nil
+		return fmt.Errorf("tun %s: %w", name, err)
+	}
+	if e.d.Iface != name {
+		e.d.Iface = name
+		if err := e.d.Save(e.cfg.DevicePath); err != nil {
+			e.cfg.Logf("device.json: %v", err)
+		}
+	}
+	if e.ifIndex != 0 || e.ifLUID != 0 {
+		e.cfg.Logf("tun: %s %s/32 mtu %d ifindex %d luid %d", name, e.d.AddrV4, MTU, e.ifIndex, e.ifLUID)
+		return nil
+	}
+	e.cfg.Logf("tun: %s %s/32 mtu %d", name, e.d.AddrV4, MTU)
+	return nil
+}
+
+func (e *Engine) tearDownTUN() {
+	if e.tunDev == nil {
+		return
+	}
+	e.detachProbeStack()
+	tundev.Teardown(e.cfg.Run, e.iface)
+	e.tunDev.Close()
+	e.tunDev = nil
+}
+
+func (e *Engine) write(s status.Status) {
+	if s.EdgeSelection == "" {
+		if e.scanning {
+			s.EdgeSelection = "scanning"
+		} else if result, ok := e.edges[e.currentStep]; ok {
+			s.EdgeColo = result.Colo
+			s.EdgeCountry = result.Country
+			s.EdgeRTTMs = int(result.RTT / time.Millisecond)
+			s.EdgeCheckedAt = result.CheckedAt.Unix()
+			s.EdgeSelection = "unknown"
+			if result.Country == "RU" {
+				s.EdgeSelection = "domestic"
+			} else if result.Country != "" {
+				s.EdgeSelection = "foreign"
+			}
+		} else if e.currentStep.Transport != "" {
+			s.EdgeSelection = "fallback"
+		}
+	}
+	s.PID = os.Getpid()
+	s.MemKB = status.RSSKB()
+	if s.LastError == "" {
+		s.LastError = e.lastErr
+	}
+	if s.Iface == "" {
+		s.Iface = e.iface
+	}
+	if s.IfIndex == 0 {
+		s.IfIndex = e.ifIndex
+	}
+	if s.IfLUID == "" && e.ifLUID != 0 {
+		s.IfLUID = strconv.FormatUint(e.ifLUID, 10)
+	}
+	if s.Since == 0 {
+		s.Since = e.since.Unix()
+	}
+	_ = e.st.Write(s)
+}

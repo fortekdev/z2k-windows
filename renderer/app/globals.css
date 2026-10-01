@@ -1,0 +1,33 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg: #0d1117;
+  --color-panel: #151b23;
+  --color-panel-2: #1c2430;
+  --color-line: #263040;
+  --color-fg: #e6edf3;
+  --color-muted: #8b98a8;
+  --color-accent: #3fb6ff;
+  --color-ok: #3fcf8e;
+  --color-warn: #f5b84a;
+  --color-bad: #ff6b6b;
+  --font-sans: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Cascadia Mono", "Consolas", ui-monospace, monospace;
+}
+
+html, body { height: 100%; }
+body {
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  overflow: hidden;
+}
+input, textarea, select, .selectable { user-select: text; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: #2b3546; border-radius: 6px; border: 2px solid var(--color-bg); }
+::-webkit-scrollbar-track { background: transparent; }
+.drag { -webkit-app-region: drag; }
+.no-drag { -webkit-app-region: no-drag; }
