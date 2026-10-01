@@ -48,7 +48,7 @@ npm run build:warpd    # движок WARP
 npm run dev            # запуск в режиме разработки (или F5 в VS Code)
 npm test               # тесты
 npm run build          # портативная сборка в release/
-npm run release        # релиз: сборка на GitHub Actions и публикация в Releases
+npm run release        # новая версия (0.1.0 → 0.1.1), сборка на GitHub Actions и публикация в Releases
 ```
 
 Стек: Electron, Next.js, React, TypeScript.
