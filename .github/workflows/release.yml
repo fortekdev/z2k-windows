@@ -1,0 +1,64 @@
+# Сборка portable-exe на Windows и публикация в GitHub Releases.
+# Запуск: тег vX.Y.Z (его ставит `npm run release`) или вручную на вкладке Actions.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Тег релиза (например, v0.1.0). Пусто — v<версия из package.json>'
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Установка зависимостей
+        run: npm ci
+
+      - name: Сборка (npm run build)
+        run: npm run build
+
+      - name: Тег релиза
+        id: tag
+        shell: pwsh
+        run: |
+          $tag = '${{ github.event.inputs.tag }}'
+          if (-not $tag) {
+            if ('${{ github.ref_type }}' -eq 'tag') { $tag = '${{ github.ref_name }}' }
+            else { $tag = 'v' + (Get-Content package.json -Raw | ConvertFrom-Json).version }
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Публикация в Releases
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          $exe = Get-ChildItem release -Filter *-portable.exe | Select-Object -First 1
+          if (-not $exe) { throw 'В release/ нет portable-exe — сборка не удалась' }
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            # релиз уже есть (повторный запуск) — заменяем файл
+            gh release upload $env:TAG $exe.FullName --clobber
+          } else {
+            gh release create $env:TAG $exe.FullName --title "z2k Windows $env:TAG" --generate-notes --target $env:GITHUB_SHA
+          }

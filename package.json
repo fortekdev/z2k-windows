@@ -24,7 +24,8 @@
     "build:warpd": "node scripts/build-warpd.mjs",
     "build:tgredir": "node scripts/build-tgredir.mjs",
     "build:relay": "node scripts/build-relay.mjs",
-    "build:app": "node scripts/gen-icon.mjs && npm run build:renderer && npm run build:electron"
+    "build:app": "node scripts/gen-icon.mjs && npm run build:renderer && npm run build:electron",
+    "release": "node scripts/release.mjs"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.3.3",
@@ -87,6 +88,7 @@
     "portable": {
       "artifactName": "z2k-windows-${version}-portable.${ext}"
     },
-    "compression": "store"
+    "compression": "store",
+    "publish": null
   }
 }

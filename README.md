@@ -15,7 +15,7 @@
 
 ## Как запустить
 
-1. Скачайте `z2k-windows-<версия>-portable.exe` и запустите. Установка не нужна.
+1. Скачайте `z2k-windows-<версия>-portable.exe` со страницы [Releases](https://github.com/fortekdev/z2k-windows/releases/latest) и запустите. Установка не нужна.
 2. Подтвердите запуск от имени администратора — без этого обход работать не сможет.
 3. На главном экране нажмите **«Включить обход»**.
 
@@ -48,6 +48,7 @@ npm run build:warpd    # движок WARP
 npm run dev            # запуск в режиме разработки (или F5 в VS Code)
 npm test               # тесты
 npm run build          # портативная сборка в release/
+npm run release        # релиз: сборка на GitHub Actions и публикация в Releases
 ```
 
 Стек: Electron, Next.js, React, TypeScript.
