@@ -1,4 +1,4 @@
-import { app, dialog } from 'electron';
+import { app, dialog, powerMonitor } from 'electron';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createWindow, getWindow, registerScheme, SCREENSHOT, serveRenderer } from './window';
@@ -44,6 +44,8 @@ async function boot() {
 
   const autostarted = process.argv.includes('--autostart');
   const win = createWindow();
+  // Windows: событие окна при выключении/перезагрузке/выходе из учётной записи
+  win.on('session-end', onSessionEnd);
   if (autostarted && s.startMinimized) win.once('ready-to-show', () => win.hide());
 
   // Свернуть = спрятать в трей: hide() убирает окно с панели задач, открывается кликом по значку в трее
@@ -112,6 +114,16 @@ app.on('before-quit', (e) => {
   tgRedirect.killNow();
   void tgProxy.stop();
 });
+
+// Выключение/перезагрузка Windows и выход из учётной записи: before-quit в этом случае не приходит,
+// а DNS адаптера, оставленный на 127.0.0.1, пережил бы перезагрузку — «без доступа к интернету» без программы.
+const onSessionEnd = () => {
+  quitting = true;
+  disableDohSync();
+  engine.killNow();
+  warp.killNow();
+};
+app.whenReady().then(() => powerMonitor.on('shutdown', onSessionEnd)).catch(() => undefined);
 
 app.on('window-all-closed', () => {
   // остаёмся в трее
