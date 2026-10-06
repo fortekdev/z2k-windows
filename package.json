@@ -1,7 +1,7 @@
 {
   "name": "z2k-windows",
   "productName": "z2k Windows",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Обход DPI-блокировок для Windows (порт z2k/zapret2): автоподбор стратегий и локальный Telegram-прокси",
   "author": "Rubot.Cloud",
   "license": "MIT",
